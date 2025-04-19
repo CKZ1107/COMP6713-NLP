@@ -1,15 +1,15 @@
 import torch
-import numpy as np
 import pandas as pd
-from datetime import datetime
 from nltk.corpus import wordnet as wn
 from nltk.corpus import sentiwordnet as swn
 from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import LabelEncoder
 
-from .setup import default_tokenizer
+from .setup import *
 
 
 # ------------------ WordNet ------------------ #
+
 
 def simple_pos_tag(tokens):
     """
@@ -44,7 +44,7 @@ def simple_pos_tag(tokens):
     return tagged
 
 
-def enhance_text_with_wordnet(text):
+def wordnet(text):
     """
     Enhance text with WordNet features including synonyms and sentiment scores.
     Fully robust implementation that doesn't rely on NLTK's POS tagger.
@@ -155,14 +155,31 @@ def enhance_text_with_wordnet(text):
         return text if isinstance(text, str) else str(text)
 
 
+def tokenize_llm(example, model_name):
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    prompt = example["input"]
+    label = example["output"]
+    tokenized = tokenizer(prompt, truncation=True, padding="max_length", max_length=512)
+    with tokenizer.as_target_tokenizer():
+        labels = tokenizer(label, truncation=True, padding="max_length", max_length=10)
+        labels["input_ids"] = [
+          (label if label != tokenizer.pad_token_id else -100) for label in labels["input_ids"]
+        ]
+    tokenized["labels"] = [(l if l != tokenizer.pad_token_id else -100) for l in labels["input_ids"]]
+    return tokenized
+
+
 # ------------------ Finalized Enhanced Dataset ------------------ #
+
 
 class EnhancedDataset(Dataset):
     """
     The finalized Enhanced Dataset, which tokenize texts and create a WordNet dataset.
     """
     def __init__(
-        self, texts, dates, labels, stock_names, tokenizer, max_chunk_length=256, max_chunks=8, use_wordnet=True
+        self, texts, dates, labels, stock_names, tokenizer, max_chunk_length=256, max_chunks=8,
+        use_wordnet=True, embed_datetime=False
     ):
         self.texts = texts
         self.dates = dates
@@ -172,6 +189,7 @@ class EnhancedDataset(Dataset):
         self.max_chunk_length = max_chunk_length
         self.max_chunks = max_chunks
         self.use_wordnet = use_wordnet
+        self.embed_datetime = embed_datetime
 
         # encode stock names to indices
         self.stock_to_idx = {name: idx for idx, name in enumerate(sorted(set(stock_names)))}
@@ -187,9 +205,8 @@ class EnhancedDataset(Dataset):
         self.time_values = \
             [days / max_days for days in self.time_values] if max_days > 0 else [0] * len(self.time_values)
 
-        # enhance text
         self.enhanced_texts = [
-            enhance_text_with_wordnet(str(t)) if use_wordnet else str(t) for t in self.texts
+            wordnet(str(t)) if use_wordnet else str(t) for t in self.texts
         ]
 
     def __len__(self):
@@ -232,6 +249,66 @@ class EnhancedDataset(Dataset):
         }
 
 
+class FinEnhancedDataset(Dataset):
+    def __init__(self, df, tokenizer, max_len=128, embed_datetime=False):
+        self.df = df
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+        self.embed_datetime = embed_datetime
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(
+            self, index,  model_label='label_encoded', label='label',
+            date='trading_day', post='post', stock='stock'
+        ):
+        stockname = self.df.iloc[index][stock]
+        post = self.df.iloc[index][post]
+        label = self.df.iloc[index][model_label]
+
+        # Embed the stock name into the input text
+        if self.embed_datetime:
+            datetime_value = self.df.iloc[index][date]
+            datetime_str = pd.to_datetime(datetime_value).strftime('%Y-%m-%d %H:%M')
+            input_text = f"[STOCK: {stockname}] [DATETIME: {datetime_str}] {post}"
+        else:
+            input_text = f"[STOCK: {stockname}] {post}"
+
+        encoding = self.tokenizer(
+            input_text,
+            padding='max_length',
+            truncation=True,
+            max_length=self.max_len,
+            return_tensors='pt'
+        )
+
+        return {
+            'input_ids': encoding['input_ids'].squeeze(),
+            'attention_mask': encoding['attention_mask'].squeeze(),
+            'labels': torch.tensor(label, dtype=torch.long)
+        }
+
+
+class LangChainDataset(Dataset):
+    def __init__(self, df: pd.DataFrame, max_length=None):
+        all_posts = df[post].values
+        # all_stocks = df[stock].values
+        all_posts_truncated = []
+        for posts in all_posts:
+            posts_res = []
+            total_len = 0
+            for post in posts.split(' [SEP] '):
+                if max_length is None or total_len < max_length:
+                    posts_res.append(post)
+            all_posts_truncated.append(' [SEP] '.join(posts_res))
+
+    def __getitem__(self, idx):
+        text = self.stock_texts[idx]
+        prompt = f"{text}"
+        return prompt
+
+
 def collate_temporal_batch(batch, label='label'):
     input_ids_list = [item['input_ids'] for item in batch]
     attention_mask_list = [item['attention_mask'] for item in batch]
@@ -243,72 +320,97 @@ def collate_temporal_batch(batch, label='label'):
 
 # ------------------ Finalized Enhanced Dataset ------------------ #
 
+
 def get_split_datasets(
-    df, labels, train_size=0.7, val_size=0.15, tokenizer=default_tokenizer, use_wordnet=True,
-    max_chunks=8, batch_size=4, max_chunk_length=256, model_label='bert_label', label='label',
+    df, train_size=0.7, val_size=0.15, tokenizer=default_tokenizer, use_wordnet=True, flag='bert',
+    max_chunks=8, batch_size=4, max_chunk_length=256, model_label='label_encoded', label='label',
     date='trading_day', post='post', stock='stock'
 ):
     # date time conversion and get the unique timestamps by interval
     df[date] = pd.to_datetime(df[date])
     df = df.sort_values(date)
+    # get splits
     time_interval_count = df[date].unique()
     train_idx = int(len(time_interval_count) * train_size)
     val_idx = int(len(time_interval_count) * (train_size + val_size))
     train_cutoff = time_interval_count[train_idx]
     val_cutoff = time_interval_count[val_idx]
     # get the label map that is more compatible to sentiment analysis models
-    label_map = {label: i for i, label in enumerate(sorted(labels))}
-
+    label_encoder = LabelEncoder()
+    df[model_label] = label_encoder.fit_transform(df[label])
     train_df = df[df[date] <= train_cutoff]
     val_df = df[(df[date] > train_cutoff) & (df[date] <= val_cutoff)]
     test_df = df[df[date] > val_cutoff]
 
-    train_df[model_label] = train_df[label].map(label_map)
-    val_df[model_label] = val_df[label].map(label_map)
-    test_df[model_label] = test_df[label].map(label_map)
+    if flag == 'bert':
+        # train set and loader
+        train_texts = train_df[post].values
+        train_dates = train_df[date].values
+        train_labels = train_df[model_label].values
+        train_stocks = train_df[stock].values
+        train_dataset = EnhancedDataset(
+            train_texts, train_dates, train_labels, train_stocks, tokenizer, max_chunk_length,
+            max_chunks, use_wordnet
+        )
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_temporal_batch
+        )
 
-    train_texts = train_df[post].values
-    train_dates = train_df[date].values
-    train_labels = train_df[model_label].values
-    train_stocks = train_df[stock].values
+        # validate set and loader
+        val_texts = val_df[post].values
+        val_dates = val_df[date].values
+        val_labels = val_df[model_label].values
+        val_stocks = val_df[stock].values
+        val_dataset = EnhancedDataset(
+            val_texts, val_dates, val_labels, val_stocks, tokenizer, max_chunk_length,
+            max_chunks, use_wordnet
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_temporal_batch
+        )
 
-    val_texts = val_df[post].values
-    val_dates = val_df[date].values
-    val_labels = val_df[model_label].values
-    val_stocks = val_df[stock].values
+        # test set and loader
+        test_texts = test_df[post].values
+        test_dates = test_df[date].values
+        test_labels = test_df[model_label].values
+        test_stocks = test_df[stock].values
+        test_dataset = EnhancedDataset(
+            test_texts, test_dates, test_labels, test_stocks, tokenizer, max_chunk_length,
+            max_chunks, use_wordnet
+        )
+        test_loader = DataLoader(
+            test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_temporal_batch
+        )
+    elif flag:
+        train_dataset = FinEnhancedDataset(train_df, tokenizer, embed_datetime=True)
+        test_dataset = FinEnhancedDataset(test_df, tokenizer, embed_datetime=True)
+        val_dataset = FinEnhancedDataset(val_df, tokenizer, embed_datetime=True)
 
-    test_texts = test_df[post].values
-    test_dates = test_df[date].values
-    test_labels = test_df[model_label].values
-    test_stocks = test_df[stock].values
-
-    print(f"Train set: {len(train_texts)} examples")
-    print(f"Validation set: {len(val_texts)} examples")
-    print(f"Test set: {len(test_texts)} examples")
-
-    # WordNet enhancement test
-    if use_wordnet:
-        print("\nTesting WordNet enhancement...")
-        for i in range(min(3, len(train_texts))):
-            print(f"Original: {train_texts[i][:100]}...")
-            enhanced = enhance_text_with_wordnet(str(train_texts[i]))
-            print(f"Enhanced: {enhanced[:100]}...\n")
-
-    train_dataset = EnhancedDataset(
-        train_texts, train_dates, train_labels, train_stocks, tokenizer, max_chunk_length, max_chunks, use_wordnet
-    )
-    val_dataset = EnhancedDataset(
-        val_texts, val_dates, val_labels, val_stocks, tokenizer, max_chunk_length, max_chunks, use_wordnet
-    )
-    test_dataset = EnhancedDataset(
-        test_texts, test_dates, test_labels, test_stocks, tokenizer, max_chunk_length, max_chunks, use_wordnet
-    )
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_temporal_batch)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_temporal_batch)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_temporal_batch)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    else:
+        train_loader, test_loader, val_loader = None, None, None
     return (
         (train_loader, train_df),
         (val_loader  , val_df  ),
         (test_loader , test_df ),
     )
+
+
+def get_llm_datasets(train_df, val_df, model_name):
+    from datasets import Dataset as D
+    convert = lambda row: {"input": f"Classify sentiment: {row['post']}", "output": str(row["label"])}
+    tokenize = lambda input: tokenize_llm(input, model_name)
+
+    # convert and create HF Datasets
+    converted_train = train_df.apply(convert, axis=1).tolist()
+    converted_val = val_df.apply(convert, axis=1).tolist()
+
+    train_dataset = D.from_list(converted_train)
+    val_dataset = D.from_list(converted_val)
+
+    # tokenize using your existing tokenize function
+    train_dataset = train_dataset.map(tokenize)
+    val_dataset = val_dataset.map(tokenize)
+    return train_dataset, val_dataset
