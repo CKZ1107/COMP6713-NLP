@@ -56,7 +56,7 @@ def evaluate_model_by_stock(model, test_loader, test_df, stock_column, post_colu
     # create a results dataframe
     results_df = test_df.copy()
     results_df['prediction'] = all_preds
-    results_df['correct'] = results_df['prediction'] == results_df['bert_label']
+    results_df['correct'] = results_df['prediction'] == results_df['label_encoded']
 
     # add probability columns
     if len(all_probs) > 0 and len(all_probs[0]) >= 2:
@@ -76,7 +76,7 @@ def evaluate_model_by_stock(model, test_loader, test_df, stock_column, post_colu
             print(f"Skipping {stock} - insufficient test samples ({len(group)})")
             continue
 
-        true_labels = group['bert_label'].values
+        true_labels = group['label_encoded'].values
         preds = group['prediction'].values
 
         # calculate metrics
@@ -107,7 +107,7 @@ def evaluate_model_by_stock(model, test_loader, test_df, stock_column, post_colu
             continue
 
     # calculate overall metrics
-    overall_true = results_df['bert_label'].values
+    overall_true = results_df['label_encoded'].values
     overall_preds = results_df['prediction'].values
 
     overall_metrics = {
@@ -200,7 +200,7 @@ def evaluate_model_by_stock(model, test_loader, test_df, stock_column, post_colu
             print(f"\nStock: {row[stock_column]}")
             text = str(row[post_column])
             print(f"Text: {text[:150]}..." if len(text) > 150 else f"Text: {text}")
-            print(f"True Label: {'Increase' if row['bert_label'] == 1 else 'Decrease'}")
+            print(f"True Label: {'Increase' if row['label_encoded'] == 1 else 'Decrease'}")
             print(f"Predicted: {'Increase' if row['prediction'] == 1 else 'Decrease'} (Confidence: {row['confidence']:.2f})")
             print("-" * 50)
     else:
@@ -279,13 +279,13 @@ def analyze_stock_specific_errors(results_df, stock_column, post_column):
             for _, row in stock_errors.head(2).iterrows():
                 text = str(row[post_column])
                 text_preview = text[:150] + "..." if len(text) > 150 else text
-                print(f"  - True: {'Increase' if row['bert_label'] == 1 else 'Decrease'}, Predicted: {'Increase' if row['prediction'] == 1 else 'Decrease'}")
+                print(f"  - True: {'Increase' if row['label_encoded'] == 1 else 'Decrease'}, Predicted: {'Increase' if row['prediction'] == 1 else 'Decrease'}")
                 print(f"    Text: {text_preview}")
                 print()
     return error_rates
 
 
-def print_evaluation_report(val_loader, Model, model_dir=None, model=None):
+def print_evaluation_report(val_loader, model_dir=None, model=None, Model=None):
     all_preds = []
     all_labels = []
     if not model:
