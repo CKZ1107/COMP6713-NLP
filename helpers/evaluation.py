@@ -6,13 +6,13 @@ import seaborn as sns
 from sklearn.metrics import (
     classification_report, accuracy_score, confusion_matrix, f1_score, precision_score, recall_score
 )
-from .setup import device
+from .setup import device, num_labels
 
 
 # ---------------------- Stock-specific Evaluation functions ---------------------- #
 
 
-def evaluate_model_by_stock(model, test_loader, test_df, stock_column, post_column):
+def evaluate_model_by_stock(model, test_loader, test_df, stock_column, post_column, hierarchical=True):
     """
     Robust evaluation function that analyzes model performance by stock
 
@@ -33,16 +33,19 @@ def evaluate_model_by_stock(model, test_loader, test_df, stock_column, post_colu
     # get all predictions
     with torch.no_grad():
         for batch in test_loader:
-            input_ids_list, attention_mask_list, time_values, stock_indices, labels = batch
+            input_ids_list, attention_mask_list, time_values, stock_indices, _ = batch
 
             # move tensors to device
-            input_ids_list = [ids.to(device) for ids in input_ids_list]
-            attention_mask_list = [mask.to(device) for mask in attention_mask_list]
+            input_ids = [ids.to(device) for ids in input_ids_list]
+            attention_masks = [mask.to(device) for mask in attention_mask_list]
             time_values = time_values.to(device)
             stock_indices = stock_indices.to(device)
+            if not hierarchical:
+                input_ids = input_ids[0]
+                attention_masks = attention_masks[0]
 
             # get model outputs
-            outputs = model(input_ids_list, attention_mask_list, time_values, stock_indices)
+            outputs = model(input_ids, attention_masks, time_values, stock_indices)
             probs = torch.nn.functional.softmax(outputs, dim=1)
             _, preds = torch.max(outputs, 1)
 
@@ -280,6 +283,32 @@ def analyze_stock_specific_errors(results_df, stock_column, post_column):
                 print(f"    Text: {text_preview}")
                 print()
     return error_rates
+
+
+def print_evaluation_report(val_loader, Model, model_dir=None, model=None):
+    all_preds = []
+    all_labels = []
+    if not model:
+        model = Model.from_pretrained(model_dir, num_labels=num_labels)
+    model.to(device)
+    model.eval()
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            preds = torch.argmax(outputs.logits, dim=1)
+
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    print("Classification Report:")
+    print(classification_report(all_labels, all_preds, target_names=['decrease', 'increase']))
+
+    accuracy = accuracy_score(all_labels, all_preds)
+    print(f"Accuracy: {accuracy:.4f}")
 
 
 # ---------------------- Time-series Performance Analysis functions ---------------------- #

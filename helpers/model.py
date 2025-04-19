@@ -2,9 +2,11 @@ import os
 import json
 import torch
 from .setup import default_tokenizer, device
+from sklearn.metrics import classification_report, accuracy_score
 
 
 # -------------------- Save and Load model -------------------- #
+
 
 def save_model(model, model_config, save_dir, tokenizer=default_tokenizer):
     """
